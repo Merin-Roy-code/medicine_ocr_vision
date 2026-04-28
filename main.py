@@ -124,20 +124,21 @@ class HealthResponse(BaseModel):
     version: str
 
 
+import asyncio
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline orchestrator (called by the endpoint)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(image_bytes: bytes) -> ExtractionResponse:
+async def run_pipeline(image_bytes: bytes) -> ExtractionResponse:
     """
-    Execute the full OCR pipeline for one image.
+    Execute the full OCR pipeline for one image asynchronously.
 
     Stages:
-      1. Preprocess  — OpenCV enhancement (CLAHE, denoise, sharpen, normalize).
-      2. OCR         — Google Cloud Vision DOCUMENT_TEXT_DETECTION.
-      3. Extract     — Text cleaning + regex field extraction.
-      4. Fuzzy match — RapidFuzz correction of medicine name + manufacturer.
-      5. Assemble    — Build the final ExtractionResponse.
+      1. OCR         — Google Cloud Vision DOCUMENT_TEXT_DETECTION (direct on raw image).
+      2. Extract     — Text cleaning + regex field extraction.
+      3. DB Match    — Exact SQL lookup of medicine name + manufacturer.
+      4. Assemble    — Build the final ExtractionResponse.
 
     Args:
         image_bytes: Raw bytes of the uploaded image file.
@@ -147,22 +148,23 @@ def run_pipeline(image_bytes: bytes) -> ExtractionResponse:
     """
     t_start = time.perf_counter()
 
-    # ── Stage 1: Preprocess ────────────────────────────────────────────────
-    logger.info("Stage 1/4 — Preprocessing image …")
-    _, preprocessed_bytes = preprocess(image_bytes)
+    # ── Stage 1: Preprocess (BYPASSED) ─────────────────────────────────────
+    logger.info("Stage 1/4 — Preprocessing image (BYPASSED — using raw bytes for Cloud Vision) …")
+    # _, preprocessed_bytes = await asyncio.to_thread(preprocess, image_bytes)
 
     # ── Stage 2: OCR ───────────────────────────────────────────────────────
     logger.info("Stage 2/4 — Running OCR …")
-    full_text, blocks = run_ocr(preprocessed_bytes)
+    full_text, blocks = await asyncio.to_thread(run_ocr, image_bytes)
     block_texts = [b.text for b in blocks]
 
     # ── Stage 3: Extract ───────────────────────────────────────────────────
     logger.info("Stage 3/4 — Extracting fields …")
-    raw = extract_all(full_text, block_texts)
+    raw = await asyncio.to_thread(extract_all, full_text, block_texts)
 
     # ── Stage 4: Fuzzy match ───────────────────────────────────────────────
     logger.info("Stage 4/4 — Running fuzzy matching …")
-    med_result, mfr_result = run_fuzzy_matching(
+    from fuzzy_match import run_fuzzy_matching_async
+    med_result, mfr_result = await run_fuzzy_matching_async(
         medicine_candidates=raw.medicine_name_candidates,
         raw_manufacturer=raw.manufacturer,
     )
@@ -184,7 +186,7 @@ def run_pipeline(image_bytes: bytes) -> ExtractionResponse:
         confidence=round(final_confidence, 4),
         batch=raw.batch,
         expiry=raw.expiry,
-        manufacturer=mfr_result.matched_value,
+        manufacturer=med_result.db_manufacturer or mfr_result.matched_value,
         composition=raw.composition,
         raw_ocr_text=full_text,
         processing_time_ms=round(elapsed_ms, 2),
@@ -236,10 +238,9 @@ async def extract(
     Upload a medicine strip photo and receive structured extraction results.
 
     **Pipeline stages:**
-    1. OpenCV preprocessing (CLAHE, denoising, sharpening, glare reduction)
-    2. Google Cloud Vision OCR (DOCUMENT_TEXT_DETECTION)
-    3. Regex-based field extraction with OCR error correction
-    4. RapidFuzz medicine name & manufacturer fuzzy matching
+    1. Google Cloud Vision OCR (DOCUMENT_TEXT_DETECTION directly on raw image)
+    2. Regex-based field extraction with OCR error correction
+    3. DuckDB exact medicine name & manufacturer matching
 
     **Returns:** JSON with `medicine_name`, `confidence`, `batch`, `expiry`,
     `manufacturer`, `raw_ocr_text`, and `processing_time_ms`.
@@ -276,7 +277,7 @@ async def extract(
 
     # ── Run pipeline ───────────────────────────────────────────────────────
     try:
-        result = run_pipeline(image_bytes)
+        result = await run_pipeline(image_bytes)
     except EnvironmentError as exc:
         # Missing credentials — surface as 503 (server configuration error)
         logger.error(f"EnvironmentError: {exc}")

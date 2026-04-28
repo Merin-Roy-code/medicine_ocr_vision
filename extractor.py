@@ -70,6 +70,10 @@ _OCR_KEYWORD_FIXES: dict[str, str] = {
     "MIFG": "MFG",
     "MFD": "MFG",
     "MFD.": "MFG",
+    "ALD": "MFG",
+    "ALD.": "MFG",
+    "AD": "MFG",
+    "AD.": "MFG",
     "MANUFACT": "MFG",
     # Misc
     "LTD": "LTD.",
@@ -141,8 +145,11 @@ def extract_batch(text: str) -> Optional[str]:
         r"""
         (?:
             BATCH\s*(?:NO|NUMBER|NO\.?|\.)?   # BATCH NO / BATCH NUMBER / BATCH.
-          | B\.?\s*NO\.?                        # B.NO / B NO
+          | B\.?\s*N[O0]\.?                     # B.NO / B.N0
+          | B[A-Z0-9]?\/?\s*N[O0]?\.?           # BN / B/N / B.N.
           | LOT\s*(?:NO\.?|NUMBER)?             # LOT / LOT NO / LOT NUMBER
+          | CH\.?\-?B\.?                        # Ch.-B. (German/European)
+          | L\.?\s*N[O0]\.?                     # L.NO / L NO
         )
         \s*[:\-\.\s]*\s*                        # separator (colon, dash, dot, space)
         ([A-Z0-9][A-Z0-9\-\/]{2,20})            # batch value: 3–21 alphanumeric chars
@@ -249,6 +256,8 @@ def extract_expiry(text: str) -> Optional[str]:
             EXP(?:IRY|IRATION)?       # EXP / EXPIRY / EXPIRATION
           | USE\s*(?:BEFORE|BY)       # USE BEFORE / USE BY
           | BEST\s*BEFORE             # BEST BEFORE
+          | VALID\s*(?:TILL|THROUGH|UNTIL) # VALID TILL / VALID THROUGH
+          | E\.?\s*D\.?               # E.D. / E D
         )
         \.?\s*(?:DATE\.?)?\s*[:\-]?\s*  # optional "DATE", optional separator
         (                               # capture date value
@@ -323,10 +332,14 @@ def extract_manufacturer(text: str) -> Optional[str]:
         r"""
         (?:
             MFG(?:\s*BY)?               # MFG / MFG BY
-          | MANUFACTURED\s*BY          # MANUFACTURED BY
+          | MANUFACTURED\s*(?:BY|FOR)   # MANUFACTURED BY / FOR
           | MARKETED\s*(?:AND\s*(?:DISTRIBUTED\s*BY|BY))?  # MARKETED BY / AND ...
           | DISTRIBUTED\s*BY           # DISTRIBUTED BY
           | MKTD\s*BY                  # MKTD BY (abbreviation)
+          | IMPORTED\s*BY              # IMPORTED BY
+          | PRODUCT\s*OF               # PRODUCT OF
+          | PRODUCED\s*BY              # PRODUCED BY
+          | MADE\s*IN                  # MADE IN
         )
         \.?\s*[:\-]?\s*                # separator
         (?!JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|\d{2}[\/\.]) # Lookahead: Don't start with a date
@@ -366,6 +379,9 @@ def extract_medicine_name_candidates(text: str) -> list[str]:
         "KEEP", "OUT", "REACH", "CHILDREN", "PRESCRIPTION", "MEDICINE",
         "STRIP", "ONLY", "SCHEDULE", "DRUG", "INDIA", "LIMITED", "LTD",
         "M.L.", "ML", "LIC", "LICENCE", "LICENSE", "MFD", "MRB", "MRP", "INCL", "TAXES",
+        "IMPORTED", "PRODUCED", "MADE", "PRODUCT", "VALID", "TILL", "THROUGH", "UNTIL",
+        "OINTMENT", "CREAM", "DROPS", "LOTION", "PHARMA", "PHARMACEUTICALS", "DOSAGE",
+        "DIRECTED", "PHYSICIAN", "TEMPERATURE", "WARNING", "CAUTION", "PROTECT", "LIGHT",
     }
 
     # Split on newlines or multiple spaces to get logical chunks

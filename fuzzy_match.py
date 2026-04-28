@@ -5,6 +5,7 @@ REVERTED: Replaced complex multi-stage matching with a stable, faster version.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -12,7 +13,12 @@ from rapidfuzz import fuzz, process
 from loguru import logger
 
 import config
-from medicine_db import MEDICINE_DATABASE, MANUFACTURER_DATABASE, MEDICINE_SET, BASE_NAME_MAP
+from medicine_db import (
+    get_exact_match,
+    get_base_matches,
+    get_fuzzy_candidates,
+    get_fuzzy_manufacturer_candidates
+)
 
 
 @dataclass
@@ -23,42 +29,38 @@ class FuzzyMatchResult:
     raw_input: str
     score: float
     method: str = "none"
+    db_manufacturer: Optional[str] = None
 
 
 def match_medicine_name(
     candidates: list[str],
-    database: list[str] = MEDICINE_DATABASE,
     min_score: float = config.FUZZY_MIN_SCORE,
 ) -> FuzzyMatchResult:
     """
     Find the best match for medicine candidates.
-    1. Check for exact match in the normalized MEDICINE_SET (O(1)).
-    2. Check for exact match in BASE_NAME_MAP (O(1)).
-    3. Fall back to fuzzy matching (WRatio) on top candidate.
+    1. Check for exact match in DuckDB (O(1)).
+    2. Check for base name match in DuckDB (O(1)).
+    3. If no match found, rely on OCR candidate as-is (Bypassed Fuzzy Matching).
     """
-    if not candidates or not database:
+    if not candidates:
         return FuzzyMatchResult(None, 0.0, "", 0.0, "none")
 
-    best_match_value: Optional[str] = None
-    best_score: float = 0.0
-    best_raw: str = ""
-    best_method: str = "none"
-
-    # Step 1: Exact / Base Name Match (Instant O(1))
+    # Step 1 & 2: Exact / Base Name Match (Instant SQL)
     for candidate in candidates:
         upper = candidate.strip().upper()
         if not upper:
             continue
             
         # Case A: Perfect exact match
-        if upper in MEDICINE_SET:
+        exact_res = get_exact_match(upper)
+        if exact_res:
+            name, mfr = exact_res
             logger.info(f"Perfect exact match found for '{upper}'")
-            return FuzzyMatchResult(candidate.title(), 1.0, candidate, 100.0, "exact")
+            return FuzzyMatchResult(name.title(), 1.0, candidate, 100.0, "exact", db_manufacturer=mfr)
             
         # Case B: Base name match (e.g., "ALERID" -> "Alerid Tablet")
-        if upper in BASE_NAME_MAP:
-            matches = BASE_NAME_MAP[upper]
-            
+        matches = get_base_matches(upper)
+        if matches:
             # Detect form - for strips, we primarily look for Tablet or Capsule
             detected_form = None
             for form in ["TABLET", "CAPSULE", "TABS", "CAPS"]:
@@ -68,75 +70,55 @@ def match_medicine_name(
             
             # Since this is strictly for medicine strips, we prioritize Tablet/Capsule
             priority_form = detected_form or "TABLET"
-            priority_matches = [m for m in matches if priority_form in m.upper()]
+            priority_matches = [m for m in matches if priority_form in m[0].upper()]
             
-            # Select the best canonical name
-            canonical = sorted(priority_matches or matches, key=len)[0]
-            logger.info(f"Strip match found: '{upper}' -> '{canonical}' (form={priority_form})")
-            return FuzzyMatchResult(canonical, 0.95, candidate, 95.0, "strip_base_map")
-
-    # Step 2: Fuzzy Match (Fallback - Slow)
-    # To keep it fast, we only fuzzy match the first 3 candidates
-    for candidate in candidates[:3]:
-        candidate = candidate.strip()
-        if not candidate or len(candidate) < 3:
-            continue
-
-        result = process.extractOne(
-            candidate,
-            database,
-            scorer=fuzz.WRatio,
-            score_cutoff=min_score,
-        )
-
-        if result:
-            matched, score, _ = result
-            if score > best_score:
-                best_score = score
-                best_match_value = matched
-                best_raw = candidate
-                best_method = "fuzzy"
+            # Select the best canonical name tuple
+            canonical_tuple = sorted(priority_matches or matches, key=lambda x: len(x[0]))[0]
+            canonical_name, canonical_mfr = canonical_tuple
             
-            if score >= 95:
-                break
+            logger.info(f"Strip match found: '{upper}' -> '{canonical_name}' (form={priority_form})")
+            return FuzzyMatchResult(canonical_name.title(), 0.95, candidate, 95.0, "strip_base_map", db_manufacturer=canonical_mfr)
 
-    if best_score < min_score:
-        return FuzzyMatchResult(None, round(best_score / 100, 4), best_raw, best_score, best_method)
-
-    return FuzzyMatchResult(best_match_value, round(best_score / 100, 4), best_raw, best_score, best_method)
+    # If OCR reads correctly but we couldn't map to database, we bypass fuzzy matching
+    # and simply use the first raw candidate as the medicine name.
+    best_raw = candidates[0].strip()
+    return FuzzyMatchResult(best_raw.title(), 0.90, best_raw, 90.0, "ocr_raw")
 
 
 def match_manufacturer(
     raw_manufacturer: Optional[str],
-    database: list[str] = MANUFACTURER_DATABASE,
     min_score: float = config.FUZZY_MIN_SCORE - 10,
 ) -> FuzzyMatchResult:
     """
-    Fuzzy-match manufacturer name using token_set_ratio.
+    Avoid fuzzy matching as OCR reads correctly. Return the raw string directly.
     """
     if not raw_manufacturer:
         return FuzzyMatchResult(None, 0.0, "", 0.0)
 
-    result = process.extractOne(
-        raw_manufacturer.strip(),
-        database,
-        scorer=fuzz.token_set_ratio,
-        score_cutoff=min_score - 1,
-    )
+    raw_clean = raw_manufacturer.strip()
+    return FuzzyMatchResult(raw_clean.title(), 0.90, raw_clean, 90.0, "ocr_raw")
 
-    if result is None:
-        # If no match, return the raw value as fallback
-        return FuzzyMatchResult(raw_manufacturer, 0.5, raw_manufacturer, 0.0)
 
-    matched, score, _ = result
-    return FuzzyMatchResult(matched, round(score / 100, 4), raw_manufacturer, float(score))
+async def run_fuzzy_matching_async(
+    medicine_candidates: list[str],
+    raw_manufacturer: Optional[str],
+) -> tuple[FuzzyMatchResult, FuzzyMatchResult]:
+    """Execute fuzzy matching for both fields in parallel."""
+    # Use to_thread for CPU-bound RapidFuzz tasks to avoid blocking the event loop
+    med_task = asyncio.to_thread(match_medicine_name, medicine_candidates)
+    mfr_task = asyncio.to_thread(match_manufacturer, raw_manufacturer)
+    
+    return await asyncio.gather(med_task, mfr_task)
 
 
 def run_fuzzy_matching(
     medicine_candidates: list[str],
     raw_manufacturer: Optional[str],
 ) -> tuple[FuzzyMatchResult, FuzzyMatchResult]:
-    """Execute fuzzy matching for both fields."""
-    medicine_result = match_medicine_name(medicine_candidates)
-    manufacturer_result = match_manufacturer(raw_manufacturer)
-    return medicine_result, manufacturer_result
+    """Sync wrapper for run_fuzzy_matching_async."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(run_fuzzy_matching_async(medicine_candidates, raw_manufacturer))
